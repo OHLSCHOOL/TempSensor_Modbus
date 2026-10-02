@@ -4,14 +4,16 @@
 #include <WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <ModbusIP_ESP8266.h> // Modbus TCP Library
+#include <ModbusIP_ESP8266.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// --- HARDWARE CONFIGURATION ---
-#define ONE_WIRE_BUS 15
+// ============================================================================
+// CONFIGURATION SECTION
+// ============================================================================
 
-// Waveshare ESP32-S3-ETH W5500 SPI Pin Configuration
+// Hardware Configuration
+#define ONE_WIRE_BUS 15
 #define ETH_MISO_PIN 12
 #define ETH_MOSI_PIN 11
 #define ETH_SCLK_PIN 13
@@ -19,217 +21,652 @@
 #define ETH_INT_PIN  10
 #define ETH_RST_PIN  9
 
-// SSD1306 OLED I2C Configuration
+// OLED I2C Configuration
 #define OLED_SDA 17
 #define OLED_SCL 39
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
+
+// Network Configuration
+#define LOCAL_IP_ADDR    "120.28.117.19"
+#define GATEWAY_ADDR     "0.0.0.0"
+#define SUBNET_MASK      "255.255.255.0"
+#define PRIMARY_DNS_ADDR "0.0.0.0"
+#define SECONDARY_DNS_ADDR "0.0.0.0"
+#define HOSTNAME         "esp32s3-modbus-node"
+
+// Modbus TCP Configuration
+#define MODBUS_UNIT_ID 1
+#define MODBUS_PORT 502
+
+// Modbus Register Map (Holding Registers)
+#define REG_TEMP_SCALED  1  // Address 40002: Temperature * 100 (Int16)
+#define REG_TEMP_FLOAT_H 2  // Address 40003: Raw Float High Word
+#define REG_TEMP_FLOAT_L 3  // Address 40004: Raw Float Low Word
+#define REG_SENSOR_STATUS 4 // Address 40005: 0=OK, 1=ERROR
+#define REG_NET_STATUS    5 // Address 40006: 0=OFFLINE, 1=ONLINE
+
+// Task Timing Configuration
+#define SENSOR_UPDATE_INTERVAL 2000   // ms - Read sensor & update registers
+#define OLED_REFRESH_INTERVAL  4000   // ms - Cycle OLED screen views
+#define SENSOR_TIMEOUT         5000   // ms - Sensor read timeout
+#define SENSOR_HEALTH_WINDOW   30000  // ms - Health check window (30 sec)
+
+// Sensor Error Thresholds
+#define MAX_CONSECUTIVE_ERRORS 5
+#define MIN_VALID_TEMP -20.0f
+#define MAX_VALID_TEMP 80.0f
+
+// ============================================================================
+// TYPE DEFINITIONS & STATE MACHINE
+// ============================================================================
+
+typedef enum {
+  STATE_INIT,           // Initializing hardware
+  STATE_WAIT_NETWORK,   // Waiting for Ethernet link
+  STATE_NETWORK_OK,     // Network connected, Modbus active
+  STATE_SENSOR_ERROR,   // Sensor disconnected
+  STATE_FAULT,          // Critical error state
+} SystemState_t;
+
+typedef enum {
+  SENSOR_OK,
+  SENSOR_DISCONNECTED,
+  SENSOR_OUT_OF_RANGE,
+  SENSOR_TIMEOUT,
+} SensorStatus_t;
+
+typedef struct {
+  float tempC;
+  float tempF;
+  SensorStatus_t status;
+  unsigned long lastReadTime;
+  uint32_t readCount;
+  uint32_t errorCount;
+} SensorData_t;
+
+typedef struct {
+  bool eth_link;
+  bool eth_ip_assigned;
+  bool modbus_active;
+  unsigned long lastUptime;
+  IPAddress ip_address;
+} NetworkStatus_t;
+
+typedef struct {
+  uint16_t tempScaled;
+  uint16_t floatHigh;
+  uint16_t floatLow;
+  uint16_t sensorStatus;
+  uint16_t networkStatus;
+} ModbusRegisters_t;
+
+// ============================================================================
+// GLOBAL STATE VARIABLES
+// ============================================================================
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// --- STATIC NETWORK INITIALIZATION ---
-IPAddress local_IP(120, 28, 117, 19);
-IPAddress gateway(0, 0, 0, 0);
-IPAddress subnet(255, 255, 255, 0);
-IPAddress primaryDNS(0, 0, 0, 0);
-IPAddress secondaryDNS(0, 0, 0, 0);
-
-// --- MODBUS REGISTER DEFINITIONS ---
-#define REG_TEMP_SCALED  1 // Address 40002: Temp * 100 (Integer)
-#define REG_TEMP_FLOAT_H 2 // Address 40003: Raw Float Upper 16-bits
-#define REG_TEMP_FLOAT_L 3 // Address 40004: Raw Float Lower 16-bits
-#define MODBUS_UNIT_ID   1 // <-- Set the exact Slave/Unit ID your BMS expects
-
-// --- OBJECT CORES ---
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-ModbusIP mb; // Create Modbus IP Instance (listens on default port 502)
+ModbusIP mb;
 
-bool eth_connected = false;
-unsigned long lastMsgTime = 0;
-const long interval = 2000; // Update temperature registers every 2 seconds
+SystemState_t systemState = STATE_INIT;
+SensorData_t sensorData = {0.0f, 0.0f, SENSOR_DISCONNECTED, 0, 0, 0};
+NetworkStatus_t networkStatus = {false, false, false, 0, IPAddress(0, 0, 0, 0)};
+ModbusRegisters_t modbusRegs = {0, 0, 0, 1, 0};
 
-// --- OLED CYCLE CONFIGURATION ---
-unsigned long lastScreenTime = 0;
-const long screenInterval = 4000; // Cycle screens every 4 seconds
-uint8_t currentScreen = 0;        // 0 = Status, 1 = IP, 2 = Temperature
+// Task scheduling
+unsigned long lastSensorUpdateTime = 0;
+unsigned long lastOLEDRefreshTime = 0;
+unsigned long lastHealthCheckTime = 0;
 
-String displayIP = "120.28.117.19";
-String displayTempC = "Wait...";
-String displayTempF = "Wait...";
+// OLED screen cycling
+uint8_t currentOLEDScreen = 0;
+const uint8_t NUM_OLED_SCREENS = 3;
 
-void WiFiEvent(WiFiEvent_t event) {
+// Display buffers (fixed size, no dynamic String allocation)
+char displayTempC[16] = "Wait...";
+char displayTempF[16] = "Wait...";
+char displayIPAddr[24] = "0.0.0.0";
+char displayStatusStr[32] = "Initializing...";
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Log message to Serial
+ */
+void logMessage(const char* message) {
+  unsigned long uptimeMs = millis();
+  unsigned long sec = uptimeMs / 1000;
+  unsigned long ms = uptimeMs % 1000;
+  Serial.printf("[%03lu.%03lu] %s\n", sec, ms, message);
+}
+
+/**
+ * @brief Log formatted message
+ */
+void logMessagef(const char* format, ...) {
+  char buffer[128];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  logMessage(buffer);
+}
+
+/**
+ * @brief Encode 32-bit float into two 16-bit words
+ * Stores high-word in register H, low-word in register L
+ */
+void encodeFloatToRegisters(float value, uint16_t* high, uint16_t* low) {
+  uint32_t raw;
+  memcpy(&raw, &value, sizeof(raw));
+  *high = (uint16_t)(raw >> 16);
+  *low = (uint16_t)(raw & 0xFFFF);
+}
+
+/**
+ * @brief Decode 32-bit float from two 16-bit words
+ */
+float decodeFloatFromRegisters(uint16_t high, uint16_t low) {
+  uint32_t raw = ((uint32_t)high << 16) | (uint32_t)low;
+  float value;
+  memcpy(&value, &raw, sizeof(value));
+  return value;
+}
+
+// ============================================================================
+// NETWORK EVENT HANDLER
+// ============================================================================
+
+void handleEthernetEvent(WiFiEvent_t event) {
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
-      Serial.println("ETH Started");
-      ETH.setHostname("esp32s3-modbus-node");
+      logMessage("ETH Started");
+      ETH.setHostname(HOSTNAME);
       break;
+
     case ARDUINO_EVENT_ETH_CONNECTED:
-      Serial.println("ETH Cable Connected");
+      logMessage("ETH Cable Connected");
+      networkStatus.eth_link = true;
       break;
+
     case ARDUINO_EVENT_ETH_GOT_IP:
-      Serial.print("ETH IPv4: ");
-      Serial.println(ETH.localIP());
-      eth_connected = true;
-      updateOLEDDisplay();
+      logMessagef("ETH IP: %s", ETH.localIP().toString().c_str());
+      networkStatus.eth_ip_assigned = true;
+      networkStatus.ip_address = ETH.localIP();
+      snprintf(displayIPAddr, sizeof(displayIPAddr), "%s", ETH.localIP().toString().c_str());
+      systemState = STATE_NETWORK_OK;
       break;
+
     case ARDUINO_EVENT_ETH_DISCONNECTED:
-      Serial.println("ETH Cable Disconnected");
-      eth_connected = false;
-      updateOLEDDisplay();
+      logMessage("ETH Cable Disconnected");
+      networkStatus.eth_link = false;
+      networkStatus.eth_ip_assigned = false;
+      networkStatus.modbus_active = false;
+      if (systemState == STATE_NETWORK_OK) {
+        systemState = STATE_WAIT_NETWORK;
+      }
       break;
+
     default:
       break;
   }
 }
 
+// ============================================================================
+// SENSOR FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Read temperature from DS18B20 sensor
+ * Validates temperature range and manages error count
+ */
+SensorStatus_t readSensorTemperature(float* tempC) {
+  if (tempC == NULL) {
+    return SENSOR_TIMEOUT;
+  }
+
+  sensors.requestTemperatures();
+  unsigned long readStartTime = millis();
+
+  // Wait for conversion (typically 750ms for 12-bit)
+  while (!sensors.isConversionComplete() && (millis() - readStartTime < SENSOR_TIMEOUT)) {
+    delay(10);
+  }
+
+  float reading = sensors.getTempCByIndex(0);
+
+  // Check for sensor disconnect
+  if (reading == DEVICE_DISCONNECTED_C) {
+    sensorData.errorCount++;
+    logMessagef("Sensor Error: Disconnected (count: %lu)", sensorData.errorCount);
+    return SENSOR_DISCONNECTED;
+  }
+
+  // Check for out-of-range temperature
+  if (reading < MIN_VALID_TEMP || reading > MAX_VALID_TEMP) {
+    sensorData.errorCount++;
+    logMessagef("Sensor Error: Out of Range %.2f°C (count: %lu)", reading, sensorData.errorCount);
+    return SENSOR_OUT_OF_RANGE;
+  }
+
+  // Valid reading - reset error count
+  sensorData.errorCount = 0;
+  *tempC = reading;
+  return SENSOR_OK;
+}
+
+/**
+ * @brief Update sensor data and handle health checks
+ */
+void updateSensorData() {
+  float tempC = 0.0f;
+  SensorStatus_t status = readSensorTemperature(&tempC);
+
+  sensorData.lastReadTime = millis();
+  sensorData.readCount++;
+
+  if (status == SENSOR_OK) {
+    sensorData.tempC = tempC;
+    sensorData.tempF = DallasTemperature::toFahrenheit(tempC);
+    sensorData.status = SENSOR_OK;
+
+    snprintf(displayTempC, sizeof(displayTempC), "%.2f C", sensorData.tempC);
+    snprintf(displayTempF, sizeof(displayTempF), "%.1f F", sensorData.tempF);
+
+    logMessagef("Sensor OK: %.2f°C (read #%lu)", tempC, sensorData.readCount);
+
+  } else {
+    sensorData.status = status;
+
+    snprintf(displayTempC, sizeof(displayTempC), "ERROR");
+    snprintf(displayTempF, sizeof(displayTempF), "ERROR");
+
+    if (sensorData.errorCount >= MAX_CONSECUTIVE_ERRORS) {
+      logMessage("Sensor: CRITICAL - Too many consecutive errors");
+      systemState = STATE_SENSOR_ERROR;
+    }
+  }
+}
+
+// ============================================================================
+// MODBUS FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Write sensor data to Modbus holding registers
+ * Should be called after sensor data is validated
+ */
+void modbusUpdate() {
+  // Update temperature registers
+  uint16_t scaledTemp = (uint16_t)(sensorData.tempC * 100.0f);
+  modbusRegs.tempScaled = scaledTemp;
+  mb.Hreg(REG_TEMP_SCALED, scaledTemp);
+
+  // Encode 32-bit float across two registers
+  encodeFloatToRegisters(sensorData.tempC, &modbusRegs.floatHigh, &modbusRegs.floatLow);
+  mb.Hreg(REG_TEMP_FLOAT_H, modbusRegs.floatHigh);
+  mb.Hreg(REG_TEMP_FLOAT_L, modbusRegs.floatLow);
+
+  // Update sensor status register
+  modbusRegs.sensorStatus = (sensorData.status == SENSOR_OK) ? 0 : 1;
+  mb.Hreg(REG_SENSOR_STATUS, modbusRegs.sensorStatus);
+
+  // Update network status register
+  modbusRegs.networkStatus = networkStatus.eth_ip_assigned ? 1 : 0;
+  mb.Hreg(REG_NET_STATUS, modbusRegs.networkStatus);
+
+  logMessagef("Modbus Updated | Temp: %.2f°C | Scaled: %u | Sensor: %u | Network: %u",
+              sensorData.tempC, modbusRegs.tempScaled, modbusRegs.sensorStatus, modbusRegs.networkStatus);
+}
+
+/**
+ * @brief Initialize Modbus registers
+ */
+void initializeModbusRegisters() {
+  mb.addHreg(REG_TEMP_SCALED);
+  mb.addHreg(REG_TEMP_FLOAT_H);
+  mb.addHreg(REG_TEMP_FLOAT_L);
+  mb.addHreg(REG_SENSOR_STATUS);
+  mb.addHreg(REG_NET_STATUS);
+
+  // Set initial safe values
+  mb.Hreg(REG_TEMP_SCALED, 0);
+  mb.Hreg(REG_TEMP_FLOAT_H, 0);
+  mb.Hreg(REG_TEMP_FLOAT_L, 0);
+  mb.Hreg(REG_SENSOR_STATUS, 1);  // Start as error
+  mb.Hreg(REG_NET_STATUS, 0);     // Start as offline
+
+  logMessage("Modbus registers initialized");
+}
+
+// ============================================================================
+// OLED DISPLAY FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Render OLED Screen 0: System Status
+ */
+void renderScreenSystemStatus() {
+  display.setCursor(0, 18);
+  display.println("[ SYSTEM STATUS ]");
+  display.setCursor(0, 36);
+
+  const char* stateStr;
+  switch (systemState) {
+    case STATE_INIT:
+      stateStr = "Init...";
+      break;
+    case STATE_WAIT_NETWORK:
+      stateStr = "Waiting Network";
+      break;
+    case STATE_NETWORK_OK:
+      stateStr = "Network OK";
+      break;
+    case STATE_SENSOR_ERROR:
+      stateStr = "Sensor Error";
+      break;
+    case STATE_FAULT:
+      stateStr = "FAULT";
+      break;
+    default:
+      stateStr = "Unknown";
+  }
+
+  display.println(stateStr);
+  
+  const char* ethStr = networkStatus.eth_ip_assigned ? "ETH: OK" : "ETH: DOWN";
+  display.println(ethStr);
+
+  const char* sensorStr = (sensorData.status == SENSOR_OK) ? "Sensor: OK" : "Sensor: ERR";
+  display.println(sensorStr);
+}
+
+/**
+ * @brief Render OLED Screen 1: Network Configuration
+ */
+void renderScreenNetworkConfig() {
+  display.setCursor(0, 18);
+  display.println("[ NETWORK CONFIG ]");
+  display.setCursor(0, 36);
+
+  display.print("IP:  ");
+  display.println(displayIPAddr);
+
+  display.print("Sub: ");
+  display.println(SUBNET_MASK);
+
+  display.print("GW:  ");
+  display.println(GATEWAY_ADDR);
+}
+
+/**
+ * @brief Render OLED Screen 2: Temperature Data
+ */
+void renderScreenTemperatureData() {
+  display.setCursor(0, 18);
+  display.println("[ TEMPERATURE DATA ]");
+  display.setCursor(0, 36);
+
+  display.print("Celsius:    ");
+  display.println(displayTempC);
+
+  display.print("Fahrenheit: ");
+  display.println(displayTempF);
+
+  char countStr[32];
+  snprintf(countStr, sizeof(countStr), "Reads: %lu | Err: %lu", sensorData.readCount, sensorData.errorCount);
+  display.setTextSize(0);
+  display.setCursor(0, 58);
+  display.println(countStr);
+  display.setTextSize(1);
+}
+
+/**
+ * @brief Update OLED display with current screen
+ * Includes header and footer on all screens
+ */
 void updateOLEDDisplay() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  
-  // Static Header for all screens
+
+  // Header (all screens)
   display.setCursor(0, 0);
   display.println("--- BMS MODBUS NODE ---");
-  display.drawLine(0, 11, 128, 11, SSD1306_WHITE); // Visual separator line
+  display.drawLine(0, 11, 128, 11, SSD1306_WHITE);
 
-  // Dynamic Content Area based on current screen
-  switch (currentScreen) {
-    case 0: // SCREEN 1: SYSTEM STATUS
-      display.setCursor(0, 18);
-      display.println("[ SYSTEM STATUS ]");
-      display.setCursor(0, 36);
-      if (eth_connected) {
-        display.println("Network: Connected");
-        display.println("Modbus TCP: Active");
-      } else {
-        display.println("Network: DISCONNECTED");
-        display.println("Modbus TCP: Offline");
-      }
+  // Dynamic content based on current screen
+  switch (currentOLEDScreen) {
+    case 0:
+      renderScreenSystemStatus();
       break;
-
-    case 1: // SCREEN 2: NETWORK CONFIG
-      display.setCursor(0, 18);
-      display.println("[ NETWORK CONFIG ]");
-      display.setCursor(0, 36);
-      display.print("IP:  ");
-      display.println(displayIP);
-      display.print("Sub: 255.255.255.0");
+    case 1:
+      renderScreenNetworkConfig();
       break;
-
-    case 2: // SCREEN 3: SENSOR DATA
-      display.setCursor(0, 18);
-      display.println("[ TEMPERATURE DATA ]");
-      display.setCursor(0, 36);
-      display.print("Celsius:    ");
-      display.println(displayTempC);
-      display.print("Fahrenheit: ");
-      display.println(displayTempF);
+    case 2:
+      renderScreenTemperatureData();
       break;
+    default:
+      currentOLEDScreen = 0;  // Safety fallback
   }
 
   display.display();
 }
 
-void setup() {
+// ============================================================================
+// HARDWARE INITIALIZATION
+// ============================================================================
+
+/**
+ * @brief Initialize Serial communication
+ */
+void initializeSerial() {
   Serial.begin(115200);
-  while (!Serial && millis() < 5000) {
+  unsigned long startTime = millis();
+  while (!Serial && (millis() - startTime < 3000)) {
     delay(10);
   }
-  Serial.println("\n--- Initializing Modbus TCP Node ---");
+  logMessage("========================================");
+  logMessage("BMS Modbus TCP Node - Production Ready");
+  logMessage("========================================");
+}
 
+/**
+ * @brief Initialize OLED display
+ */
+void initializeOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 allocation failed");
-    for(;;);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    logMessage("ERROR: SSD1306 OLED initialization failed!");
+    systemState = STATE_FAULT;
+    return;
   }
-  
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,20);
-  display.println("Booting Modbus...");
+  display.setCursor(10, 20);
+  display.println("Initializing...");
   display.display();
 
-  // Completely disable Wi-Fi and Bluetooth
+  logMessage("OLED display initialized");
+}
+
+/**
+ * @brief Initialize wireless interfaces (disable WiFi/BT, prepare ETH)
+ */
+void initializeWireless() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   btStop();
 
-  sensors.begin();
-  WiFi.onEvent(WiFiEvent);
+  logMessage("WiFi & Bluetooth disabled");
 
+  // Configure SPI for Ethernet
   SPI.begin(ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN);
+
+  WiFi.onEvent(handleEthernetEvent);
+
+  logMessage("Wireless interfaces configured");
+}
+
+/**
+ * @brief Initialize Ethernet with static IP
+ */
+void initializeEthernet() {
+  IPAddress localIP, gateway, subnet, primaryDNS, secondaryDNS;
+  localIP.fromString(LOCAL_IP_ADDR);
+  gateway.fromString(GATEWAY_ADDR);
+  subnet.fromString(SUBNET_MASK);
+  primaryDNS.fromString(PRIMARY_DNS_ADDR);
+  secondaryDNS.fromString(SECONDARY_DNS_ADDR);
+
   ETH.begin(ETH_PHY_W5500, -1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI);
 
-  if (!ETH.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("ERROR: Static IP Network Configuration Failed!");
-  } else {
-    Serial.println("Static IP Configuration Applied.");
+  if (!ETH.config(localIP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    logMessage("ERROR: Static IP configuration failed!");
+    systemState = STATE_FAULT;
+    return;
   }
 
-  // Initialize Modbus server and register map
-  mb.server();
-  mb.addHreg(REG_TEMP_SCALED);
-  mb.addHreg(REG_TEMP_FLOAT_H);
-  mb.addHreg(REG_TEMP_FLOAT_L);
+  logMessage("Ethernet static IP configuration applied");
+}
 
+/**
+ * @brief Initialize DS18B20 sensor
+ */
+void initializeSensor() {
+  sensors.begin();
+  logMessage("DS18B20 sensor initialized");
+}
+
+/**
+ * @brief Initialize Modbus TCP server
+ */
+void initializeModbus() {
+  mb.server();
+  initializeModbusRegisters();
+  logMessage("Modbus TCP server initialized");
+}
+
+// ============================================================================
+// STATE MACHINE HANDLER
+// ============================================================================
+
+/**
+ * @brief Handle state transitions and state-specific logic
+ */
+void handleSystemState() {
+  switch (systemState) {
+    case STATE_INIT:
+      // Transition to waiting for network once Ethernet hardware is ready
+      if (millis() > 5000) {
+        systemState = STATE_WAIT_NETWORK;
+        logMessage("State: WAIT_NETWORK");
+      }
+      break;
+
+    case STATE_WAIT_NETWORK:
+      // Waiting for ETH_GOT_IP event (handled in WiFiEvent callback)
+      if (networkStatus.eth_ip_assigned) {
+        systemState = STATE_NETWORK_OK;
+        logMessage("State: NETWORK_OK");
+      }
+      break;
+
+    case STATE_NETWORK_OK:
+      // Normal operating state
+      if (!networkStatus.eth_ip_assigned) {
+        systemState = STATE_WAIT_NETWORK;
+        networkStatus.modbus_active = false;
+        logMessage("State: WAIT_NETWORK (network lost)");
+      }
+      networkStatus.modbus_active = true;
+      break;
+
+    case STATE_SENSOR_ERROR:
+      // Sensor critical error - log but keep Modbus alive with error registers
+      if (sensorData.errorCount < MAX_CONSECUTIVE_ERRORS / 2) {
+        systemState = STATE_NETWORK_OK;
+        sensorData.errorCount = 0;
+        logMessage("State: Recovering from sensor error");
+      }
+      break;
+
+    case STATE_FAULT:
+      // Critical fault - system needs manual intervention
+      logMessage("State: FAULT (manual recovery required)");
+      delay(1000);
+      break;
+
+    default:
+      systemState = STATE_INIT;
+  }
+}
+
+// ============================================================================
+// MAIN SETUP
+// ============================================================================
+
+void setup() {
+  initializeSerial();
+  initializeOLED();
+  initializeWireless();
+  initializeSensor();
+  initializeEthernet();
+  initializeModbus();
+
+  logMessage("Initialization sequence complete");
   updateOLEDDisplay();
 }
 
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
 void loop() {
-  // Always run the Modbus task frame handlers if network is alive
-  if (eth_connected) {
+  unsigned long now = millis();
+
+  // Handle Modbus communication (if network is up)
+  if (networkStatus.eth_ip_assigned && systemState == STATE_NETWORK_OK) {
     mb.task();
   }
 
-  unsigned long now = millis();
+  // Handle state machine logic
+  handleSystemState();
 
-  // Task 1: Update temperature data and registers every 2 seconds
-  if (now - lastMsgTime >= interval) {
-    lastMsgTime = now;
+  // Task 1: Update sensor data and Modbus registers every 2 seconds
+  if (now - lastSensorUpdateTime >= SENSOR_UPDATE_INTERVAL) {
+    lastSensorUpdateTime = now;
 
-    sensors.requestTemperatures();
-    float tempC = sensors.getTempCByIndex(0);
-
-    if (tempC != DEVICE_DISCONNECTED_C) {
-      // 1. Process Scaled Integer (Temp * 100)
-      uint16_t scaledTemp = (uint16_t)(tempC * 100);
-      mb.Hreg(REG_TEMP_SCALED, scaledTemp);
-
-      // 2. Process Raw 32-bit Float split across two 16-bit registers
-      uint32_t floatRaw;
-      memcpy(&floatRaw, &tempC, sizeof(floatRaw));
-      mb.Hreg(REG_TEMP_FLOAT_H, (uint16_t)(floatRaw >> 16));
-      mb.Hreg(REG_TEMP_FLOAT_L, (uint16_t)(floatRaw & 0xFFFF));
-
-      // Update independent strings for screen layout
-      displayTempC = String(tempC, 2) + " C";
-      displayTempF = String(DallasTemperature::toFahrenheit(tempC), 1) + " F";
-
-      // Refresh layout safely
-      updateOLEDDisplay();
-
-      Serial.print("Modbus Regs Updated | Temp: ");
-      Serial.print(tempC);
-      Serial.print(" C | Scaled Val: ");
-      Serial.println(scaledTemp);
-    } else {
-      Serial.println("ERROR: Could not read DS18B20 sensor.");
-      displayTempC = "ERROR";
-      displayTempF = "ERROR";
-      updateOLEDDisplay();
-      
-      mb.Hreg(REG_TEMP_SCALED, 0x9999);
+    if (systemState != STATE_FAULT) {
+      updateSensorData();
+      modbusUpdate();
     }
   }
 
-  // Task 2: Cycle screen views independent of sensor readings every 4 seconds
-  if (now - lastScreenTime >= screenInterval) {
-    lastScreenTime = now;
-    
-    currentScreen = (currentScreen + 1) % 3; // Advance to next screen (0, 1, 2)
+  // Task 2: Refresh OLED display every 4 seconds (cycle through screens)
+  if (now - lastOLEDRefreshTime >= OLED_REFRESH_INTERVAL) {
+    lastOLEDRefreshTime = now;
+
+    currentOLEDScreen = (currentOLEDScreen + 1) % NUM_OLED_SCREENS;
     updateOLEDDisplay();
   }
-}
 
+  // Task 3: Health check every 30 seconds
+  if (now - lastHealthCheckTime >= SENSOR_HEALTH_WINDOW) {
+    lastHealthCheckTime = now;
+
+    logMessagef("Health Check | Uptime: %lums | Read Count: %lu | Error Count: %lu | State: %d",
+                millis(), sensorData.readCount, sensorData.errorCount, systemState);
+  }
+
+  // Small delay to prevent watchdog issues
+  delay(10);
+}

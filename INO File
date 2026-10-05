@@ -179,6 +179,17 @@ float decodeFloatFromRegisters(uint16_t high, uint16_t low) {
   return value;
 }
 
+/**
+ * @brief Read and format the Ethernet MAC address once the PHY is initialized.
+ */
+void updateMACDisplay() {
+  uint8_t mac[6];
+  ETH.macAddress(mac);
+  snprintf(displayMACAddr, sizeof(displayMACAddr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  logMessagef("MAC Address: %s", displayMACAddr);
+}
+
 // ============================================================================
 // NETWORK EVENT HANDLER
 // ============================================================================
@@ -200,9 +211,7 @@ void handleEthernetEvent(WiFiEvent_t event) {
       networkStatus.eth_ip_assigned = true;
       networkStatus.ip_address = ETH.localIP();
       snprintf(displayIPAddr, sizeof(displayIPAddr), "%s", ETH.localIP().toString().c_str());
-      
-    
-    
+      updateMACDisplay();
       systemState = STATE_NETWORK_OK;
       break;
 
@@ -515,13 +524,6 @@ void initializeWireless() {
   // Configure SPI for Ethernet
   SPI.begin(ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN);
 
- // Capture MAC address early (doesn't require network connection)
-  uint8_t mac[6];
-  ETH.macAddress(mac);
-  snprintf(displayMACAddr, sizeof(displayMACAddr), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  logMessagef("MAC Address: %s", displayMACAddr);
-  
   WiFi.onEvent(handleEthernetEvent);
 
   logMessage("Wireless interfaces configured");
@@ -539,6 +541,7 @@ void initializeEthernet() {
   secondaryDNS.fromString(SECONDARY_DNS_ADDR);
 
   ETH.begin(ETH_PHY_W5500, -1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI);
+  updateMACDisplay();
 
   if (!ETH.config(localIP, gateway, subnet, primaryDNS, secondaryDNS)) {
     logMessage("ERROR: Static IP configuration failed!");

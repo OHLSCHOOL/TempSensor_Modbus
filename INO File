@@ -29,7 +29,7 @@
 #define OLED_RESET -1
 
 // Network Configuration
-#define LOCAL_IP_ADDR    "120.28.117.19"
+#define LOCAL_IP_ADDR    "0.0.0.0" 
 #define GATEWAY_ADDR     "0.0.0.0"
 #define SUBNET_MASK      "255.255.255.0"
 #define PRIMARY_DNS_ADDR "0.0.0.0"
@@ -50,13 +50,13 @@
 // Task Timing Configuration
 #define SENSOR_UPDATE_INTERVAL 2000   // ms - Read sensor & update registers
 #define OLED_REFRESH_INTERVAL  4000   // ms - Cycle OLED screen views
-#define SENSOR_TIMEOUT         5000   // ms - Sensor read timeout
+#define SENSOR_TIMEOUT_MS         5000   // ms - Sensor read timeout
 #define SENSOR_HEALTH_WINDOW   30000  // ms - Health check window (30 sec)
 
 // Sensor Error Thresholds
 #define MAX_CONSECUTIVE_ERRORS 5
 #define MIN_VALID_TEMP -20.0f
-#define MAX_VALID_TEMP 80.0f
+#define MAX_VALID_TEMP 100.0f
 
 // ============================================================================
 // TYPE DEFINITIONS & STATE MACHINE
@@ -238,7 +238,7 @@ SensorStatus_t readSensorTemperature(float* tempC) {
   unsigned long readStartTime = millis();
 
   // Wait for conversion (typically 750ms for 12-bit)
-  while (!sensors.isConversionComplete() && (millis() - readStartTime < SENSOR_TIMEOUT)) {
+  while (!sensors.isConversionComplete() && (millis() - readStartTime < SENSOR_TIMEOUT_MS)) {
     delay(10);
   }
 

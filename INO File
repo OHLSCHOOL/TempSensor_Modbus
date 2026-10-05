@@ -201,13 +201,8 @@ void handleEthernetEvent(WiFiEvent_t event) {
       networkStatus.ip_address = ETH.localIP();
       snprintf(displayIPAddr, sizeof(displayIPAddr), "%s", ETH.localIP().toString().c_str());
       
-      // Capture MAC address
-      uint8_t mac[6];
-      ETH.macAddress(mac);
-      snprintf(displayMACAddr, sizeof(displayMACAddr), "%02X:%02X:%02X:%02X:%02X:%02X",
-               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-      logMessagef("MAC Address: %s", displayMACAddr);
-      
+    
+    
       systemState = STATE_NETWORK_OK;
       break;
 
@@ -520,6 +515,13 @@ void initializeWireless() {
   // Configure SPI for Ethernet
   SPI.begin(ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN);
 
+ // Capture MAC address early (doesn't require network connection)
+  uint8_t mac[6];
+  ETH.macAddress(mac);
+  snprintf(displayMACAddr, sizeof(displayMACAddr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  logMessagef("MAC Address: %s", displayMACAddr);
+  
   WiFi.onEvent(handleEthernetEvent);
 
   logMessage("Wireless interfaces configured");
